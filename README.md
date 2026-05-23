@@ -91,5 +91,5 @@ for item in client.iter_items(
 ## Testing
 
 ```bash
-python3 -m unittest
+python3 -m unittest discover -s tests
 ```
