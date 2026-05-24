@@ -61,6 +61,38 @@ class ProductSyncTests(unittest.TestCase):
         self.assertEqual(product["attempts"][0]["search_key"], "isbn")
         self.assertEqual(product["attempts"][1]["search_key"], "ean")
 
+    def test_fetch_product_data_parses_search_json_and_adds_readable_results(self):
+        search_payload = json.dumps(
+            {
+                "Book": [
+                    {
+                        "ISBN": "9783608942286",
+                        "Title": "Livia",
+                        "Price": "15.00",
+                        "ShippingPrice": "6.50",
+                        "SellerCountry": "DE",
+                        "Offerer": "Roxana2003",
+                        "Condition": "wie neu",
+                        "Infotext": "Wird versichert versendet.",
+                    }
+                ]
+            }
+        )
+        client = FakeSearchClient([response(search_payload)])
+
+        product = fetch_product_data(client, "9783608942286")
+
+        self.assertEqual(product["result_count"], 1)
+        self.assertEqual(product["data"]["book"][0]["shipping_price"], "6.50")
+        readable = product["readable_results"][0]
+        self.assertEqual(readable["ean"], "9783608942286")
+        self.assertEqual(readable["price_plus_shipping"], "21.50")
+        self.assertEqual(readable["location"], "DE")
+        self.assertEqual(readable["seller_name"], "Roxana2003")
+        self.assertEqual(readable["condition"], "wie neu")
+        self.assertEqual(readable["comment"], "Wird versichert versendet.")
+        self.assertIn("___", readable["display"])
+
     def test_sync_products_writes_normalized_json_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

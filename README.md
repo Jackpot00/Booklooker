@@ -105,6 +105,18 @@ falls back to `ean` when no ISBN result is returned. It requests
 `extraFields=All` by default so Booklooker returns the fullest available product
 data for the account/API quota.
 
+Each product also contains `readable_results`, a clean per-offer summary with:
+
+- `ean`
+- `price_plus_shipping`
+- `location`
+- `seller_name`
+- `condition`
+- `comment`
+
+The `display` field formats those values with `___` separators for easier manual
+reading.
+
 ## Supported endpoint helpers
 
 - `authenticate`

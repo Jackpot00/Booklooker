@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -18,6 +20,7 @@ DEFAULT_OUTPUT_FILE = PROJECT_ROOT / "data" / "booklooker_products.json"
 DEFAULT_INTERVAL_SECONDS = 3600
 DEFAULT_SEARCH_LIMIT = 150
 DEFAULT_EXTRA_FIELDS = "All"
+RESULT_SEPARATOR = "___"
 
 
 class SearchClient(Protocol):
@@ -47,6 +50,14 @@ def load_identifiers(path: Path) -> list[str]:
 
 
 def has_product_data(data: Any) -> bool:
+    offers = extract_offers(data)
+    if offers:
+        return True
+    parsed = parse_search_data(data)
+    if isinstance(parsed, dict) and any(isinstance(value, list) for value in parsed.values()):
+        return False
+    if isinstance(parsed, list):
+        return bool(parsed)
     if data is None:
         return False
     if isinstance(data, str):
@@ -54,6 +65,132 @@ def has_product_data(data: Any) -> bool:
     if isinstance(data, (list, tuple, set, dict)):
         return bool(data)
     return True
+
+
+def parse_search_data(data: Any) -> Any:
+    """Parse and normalize Booklooker search data.
+
+    The search endpoint returns JSON as a string inside ``returnValue``. Keeping
+    it parsed makes the snapshot readable and queryable.
+    """
+
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            return data
+    return normalize_keys(data)
+
+
+def normalize_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            to_snake_case(str(key)): normalize_keys(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [normalize_keys(item) for item in value]
+    return value
+
+
+def to_snake_case(value: str) -> str:
+    value = value.replace("-", "_")
+    value = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", value)
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return value.lower()
+
+
+def extract_offers(data: Any) -> list[dict[str, Any]]:
+    parsed = parse_search_data(data)
+    if isinstance(parsed, list):
+        return [offer for offer in parsed if isinstance(offer, dict)]
+    if not isinstance(parsed, dict):
+        return []
+
+    for key in ("book", "abook", "film", "music", "game"):
+        value = parsed.get(key)
+        if isinstance(value, list):
+            return [offer for offer in value if isinstance(offer, dict)]
+
+    for value in parsed.values():
+        if isinstance(value, list):
+            return [offer for offer in value if isinstance(offer, dict)]
+    return []
+
+
+def parse_money(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value).replace(",", "."))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def format_money(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return f"{value.quantize(Decimal('0.01'))}"
+
+
+def price_plus_shipping(offer: dict[str, Any]) -> str | None:
+    price = parse_money(offer.get("price"))
+    shipping = parse_money(offer.get("shipping_price"))
+    if price is None and shipping is None:
+        return None
+    return format_money((price or Decimal("0")) + (shipping or Decimal("0")))
+
+
+def clean_text(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return " ".join(str(value).split())
+
+
+def build_readable_result(
+    identifier: str, offer: dict[str, Any], index: int
+) -> dict[str, Any]:
+    ean = offer.get("ean") or offer.get("isbn") or identifier
+    condition = offer.get("condition")
+    if condition is None and offer.get("new") == 1:
+        condition = "Neuware"
+
+    result = {
+        "result_number": index,
+        "separator": RESULT_SEPARATOR,
+        "ean": ean,
+        "title": offer.get("title"),
+        "price": format_money(parse_money(offer.get("price"))),
+        "shipping_price": format_money(parse_money(offer.get("shipping_price"))),
+        "price_plus_shipping": price_plus_shipping(offer),
+        "currency": "EUR",
+        "location": offer.get("seller_country") or offer.get("country"),
+        "seller_name": offer.get("offerer"),
+        "condition": condition,
+        "comment": clean_text(offer.get("infotext")),
+        "detail_link_url": offer.get("detail_link_url"),
+    }
+    result["display"] = format_readable_result(result)
+    return result
+
+
+def format_readable_result(result: dict[str, Any]) -> str:
+    lines = [
+        f"EAN : {result.get('ean') or 'n/a'}",
+        f"Prix + Shipping : {result.get('price_plus_shipping') or 'n/a'} EUR",
+        f"Localisation : {result.get('location') or 'n/a'}",
+        f"Nom du vendeur : {result.get('seller_name') or 'n/a'}",
+        f"Etat : {result.get('condition') or 'n/a'}",
+        f"Commentaire : {result.get('comment') or 'n/a'}",
+    ]
+    return "\n".join(lines + [RESULT_SEPARATOR])
+
+
+def build_readable_results(identifier: str, data: Any) -> list[dict[str, Any]]:
+    return [
+        build_readable_result(identifier, offer, index)
+        for index, offer in enumerate(extract_offers(data), start=1)
+    ]
 
 
 def fetch_product_data(
@@ -106,6 +243,8 @@ def fetch_product_data(
             break
 
     response = best_attempt["response"]
+    parsed_data = parse_search_data(response.get("data"))
+    readable_results = build_readable_results(identifier, parsed_data)
     return {
         "identifier": identifier,
         "search_key": best_attempt["search_key"],
@@ -114,7 +253,10 @@ def fetch_product_data(
         "ok": response.get("ok", False),
         "status": response.get("status"),
         "error": response.get("error"),
-        "data": response.get("data"),
+        "result_count": len(readable_results),
+        "readable_results": readable_results,
+        "readable_text": "\n".join(result["display"] for result in readable_results),
+        "data": parsed_data,
         "raw": response.get("raw"),
         "attempts": [
             {
