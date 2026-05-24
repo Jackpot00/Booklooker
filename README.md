@@ -70,6 +70,41 @@ for item in client.iter_items(
     print(item)
 ```
 
+## Hourly ISBN/EAN product sync
+
+The repository includes `data/isbn.txt` with the requested ISBN values:
+
+```text
+9783608942286
+9783525516805
+9783421046161
+9783937715391
+9783406384936
+```
+
+Generate a normalized JSON snapshot once:
+
+```bash
+BOOKLOOKER_API_KEY="your-api-key" python3 scripts/update_booklooker_products.py
+```
+
+The default output is:
+
+```text
+data/booklooker_products.json
+```
+
+Keep the script running and refresh that JSON file every hour:
+
+```bash
+BOOKLOOKER_API_KEY="your-api-key" python3 scripts/update_booklooker_products.py --watch
+```
+
+The script searches each identifier with Booklooker's `isbn` parameter first and
+falls back to `ean` when no ISBN result is returned. It requests
+`extraFields=All` by default so Booklooker returns the fullest available product
+data for the account/API quota.
+
 ## Supported endpoint helpers
 
 - `authenticate`
