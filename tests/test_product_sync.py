@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from booklooker_client.product_sync import (
+    benchmark_products,
     fetch_product_data,
     load_identifiers,
     sync_products,
@@ -119,6 +120,66 @@ class ProductSyncTests(unittest.TestCase):
         self.assertEqual(written["products"][1]["data"], [{"title": "Second"}])
         self.assertEqual(client.calls[0]["extraFields"], "All")
         self.assertEqual(client.calls[0]["limit"], 150)
+
+    def test_benchmark_products_writes_csv_and_stats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_file = Path(tmp) / "benchmark.csv"
+            client = FakeSearchClient(
+                [
+                    response(
+                        json.dumps(
+                            {
+                                "Book": [
+                                    {
+                                        "ISBN": "9783608942286",
+                                        "Price": "10.00",
+                                        "ShippingPrice": "2.50",
+                                    }
+                                ]
+                            }
+                        )
+                    ),
+                    response([]),
+                ]
+            )
+            times = iter([0.0, 0.0, 0.25, 0.25, 0.75, 1.0])
+
+            stats = benchmark_products(
+                client,
+                ["9783608942286", "9783525516805"],
+                csv_file,
+                try_ean_fallback=False,
+                total_eans=4,
+                now=lambda: next(times),
+            )
+            rows = csv_file.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(rows[0], "ean,status,prix,temps_ms")
+        self.assertEqual(rows[1], "9783608942286,found,12.50,250")
+        self.assertEqual(rows[2], "9783525516805,not_found,,500")
+        self.assertEqual(stats["analyzed_count"], 2)
+        self.assertEqual(stats["found_count"], 1)
+        self.assertEqual(stats["not_found_count"], 1)
+        self.assertEqual(stats["api_requests"], 2)
+        self.assertEqual(stats["success_rate"], 50.0)
+        self.assertEqual(stats["eans_per_hour"], 7200.0)
+        self.assertEqual(stats["estimated_seconds"], 2.0)
+
+    def test_benchmark_products_uses_request_counter_when_provided(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_file = Path(tmp) / "benchmark.csv"
+            client = FakeSearchClient([response([]), response([])])
+            request_values = iter([5, 8])
+
+            stats = benchmark_products(
+                client,
+                ["9783608942286"],
+                csv_file,
+                request_count=lambda: next(request_values),
+                now=lambda: 1.0,
+            )
+
+        self.assertEqual(stats["api_requests"], 3)
 
 
 if __name__ == "__main__":
