@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -17,15 +18,30 @@ from .client import BooklookerClient, DEFAULT_BASE_URL
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ISBN_FILE = PROJECT_ROOT / "data" / "isbn.txt"
 DEFAULT_OUTPUT_FILE = PROJECT_ROOT / "data" / "booklooker_products.json"
+DEFAULT_BENCHMARK_CSV_FILE = PROJECT_ROOT / "data" / "booklooker_benchmark.csv"
 DEFAULT_INTERVAL_SECONDS = 3600
 DEFAULT_SEARCH_LIMIT = 150
 DEFAULT_EXTRA_FIELDS = "All"
+DEFAULT_BENCHMARK_SAMPLE_SIZE = 10_000
+DEFAULT_BENCHMARK_TOTAL_EANS = 850_000
 RESULT_SEPARATOR = "___"
 
 
 class SearchClient(Protocol):
     def search(self, **params: Any) -> dict[str, Any]:
         """Search Booklooker and return the normalized client payload."""
+
+
+class CountingSession:
+    """Requests session wrapper that counts every HTTP call made by the client."""
+
+    def __init__(self, session: Any) -> None:
+        self.session = session
+        self.request_count = 0
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:
+        self.request_count += 1
+        return self.session.request(*args, **kwargs)
 
 
 def utc_now() -> str:
@@ -336,6 +352,127 @@ def sync_products(
     return snapshot
 
 
+def first_benchmark_price(product: dict[str, Any]) -> str:
+    readable_results = product.get("readable_results")
+    if not isinstance(readable_results, list) or not readable_results:
+        return ""
+    first_result = readable_results[0]
+    if not isinstance(first_result, dict):
+        return ""
+    return str(
+        first_result.get("price_plus_shipping") or first_result.get("price") or ""
+    )
+
+
+def benchmark_products(
+    client: SearchClient,
+    identifiers: list[str],
+    csv_file: Path,
+    *,
+    medium: str = "book",
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    extra_fields: str | None = DEFAULT_EXTRA_FIELDS,
+    try_ean_fallback: bool = True,
+    total_eans: int = DEFAULT_BENCHMARK_TOTAL_EANS,
+    request_count: Any = None,
+    now: Any = time.perf_counter,
+) -> dict[str, Any]:
+    """Run the normal product lookup pipeline for a sample and write CSV timings."""
+
+    csv_file.parent.mkdir(parents=True, exist_ok=True)
+    started_at = now()
+    rows: list[dict[str, str]] = []
+    found_count = 0
+    measured_search_requests = 0
+    request_count_before = request_count() if request_count is not None else None
+
+    for identifier in identifiers:
+        item_started_at = now()
+        product = fetch_product_data(
+            client,
+            identifier,
+            medium=medium,
+            limit=limit,
+            extra_fields=extra_fields,
+            try_ean_fallback=try_ean_fallback,
+        )
+        elapsed_ms = max(0, round((now() - item_started_at) * 1000))
+        measured_search_requests += len(product.get("attempts", []))
+        found = product.get("result_count", 0) > 0
+        if found:
+            found_count += 1
+        rows.append(
+            {
+                "ean": identifier,
+                "status": "found" if found else "not_found",
+                "prix": first_benchmark_price(product),
+                "temps_ms": str(elapsed_ms),
+            }
+        )
+
+    elapsed_seconds = max(0.0, now() - started_at)
+    analyzed_count = len(identifiers)
+    not_found_count = analyzed_count - found_count
+    success_rate = (found_count / analyzed_count * 100) if analyzed_count else 0.0
+    eans_per_hour = (
+        analyzed_count / elapsed_seconds * 3600 if elapsed_seconds > 0 else 0.0
+    )
+    estimated_seconds = (
+        total_eans / eans_per_hour * 3600 if eans_per_hour > 0 else 0.0
+    )
+    if request_count is not None and request_count_before is not None:
+        api_requests = request_count() - request_count_before
+    else:
+        api_requests = measured_search_requests
+
+    with csv_file.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["ean", "status", "prix", "temps_ms"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return {
+        "analyzed_count": analyzed_count,
+        "found_count": found_count,
+        "not_found_count": not_found_count,
+        "success_rate": success_rate,
+        "api_requests": api_requests,
+        "elapsed_seconds": elapsed_seconds,
+        "eans_per_hour": eans_per_hour,
+        "estimated_seconds": estimated_seconds,
+        "csv_file": str(csv_file),
+    }
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    rounded = int(round(seconds))
+    days, remainder = divmod(rounded, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, secs = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def print_benchmark_summary(stats: dict[str, Any]) -> None:
+    print(f"EAN analysés: {stats['analyzed_count']}")
+    print(f"Offres trouvées: {stats['found_count']}")
+    print(f"Offres non trouvées: {stats['not_found_count']}")
+    print(f"Taux de réussite: {stats['success_rate']:.2f}%")
+    print(f"Nombre de requêtes API effectuées: {stats['api_requests']}")
+    print(f"Temps total: {format_duration(stats['elapsed_seconds'])}")
+    print(f"EAN traités par heure: {stats['eans_per_hour']:.2f}")
+    print(
+        "Estimation pour parcourir 850 000 EAN: "
+        f"{format_duration(stats['estimated_seconds'])}"
+    )
+    print(f"CSV benchmark: {stats['csv_file']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fetch Booklooker product data for ISBN/EAN values."
@@ -352,7 +489,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUTPUT_FILE,
         help=f"JSON file to write. Default: {DEFAULT_OUTPUT_FILE}",
     )
-    parser.add_argument("--api-key", help="Booklooker API key. Defaults to BOOKLOOKER_API_KEY.")
+    parser.add_argument(
+        "--api-key",
+        help="Booklooker API key. Defaults to BOOKLOOKER_API_KEY.",
+    )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--medium", default="book", help="Booklooker search medium.")
     parser.add_argument("--limit", type=int, default=DEFAULT_SEARCH_LIMIT)
@@ -376,6 +516,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--rate-limit-per-minute", type=int, default=100)
     parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run a benchmark on a sample of identifiers and write a CSV report.",
+    )
+    parser.add_argument(
+        "--benchmark-sample-size",
+        type=int,
+        default=DEFAULT_BENCHMARK_SAMPLE_SIZE,
+        help=(
+            "Number of identifiers to benchmark. "
+            f"Default: {DEFAULT_BENCHMARK_SAMPLE_SIZE}."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-csv",
+        type=Path,
+        default=DEFAULT_BENCHMARK_CSV_FILE,
+        help=(
+            "CSV file to write for benchmark results. "
+            f"Default: {DEFAULT_BENCHMARK_CSV_FILE}"
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-total-eans",
+        type=int,
+        default=DEFAULT_BENCHMARK_TOTAL_EANS,
+        help=(
+            "EAN count used for the runtime estimate. "
+            f"Default: {DEFAULT_BENCHMARK_TOTAL_EANS}."
+        ),
+    )
     return parser
 
 
@@ -403,12 +575,48 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
     return snapshot
 
 
+def run_benchmark_once(args: argparse.Namespace) -> dict[str, Any]:
+    identifiers = load_identifiers(args.isbn_file)[: args.benchmark_sample_size]
+    base_client = BooklookerClient(
+        api_key=args.api_key,
+        base_url=args.base_url,
+        timeout=args.timeout,
+        rate_limit_per_minute=args.rate_limit_per_minute,
+        max_retries=args.max_retries,
+    )
+    counting_session = CountingSession(base_client.session)
+    base_client.session = counting_session
+    stats = benchmark_products(
+        base_client,
+        identifiers,
+        args.benchmark_csv,
+        medium=args.medium,
+        limit=args.limit,
+        extra_fields=args.extra_fields or None,
+        try_ean_fallback=not args.no_ean_fallback,
+        total_eans=args.benchmark_total_eans,
+        request_count=lambda: counting_session.request_count,
+    )
+    print_benchmark_summary(stats)
+    return stats
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.interval_seconds < 1:
         parser.error("--interval-seconds must be at least 1")
+    if args.benchmark_sample_size < 1:
+        parser.error("--benchmark-sample-size must be at least 1")
+    if args.benchmark_total_eans < 1:
+        parser.error("--benchmark-total-eans must be at least 1")
+    if args.benchmark and args.watch:
+        parser.error("--benchmark cannot be combined with --watch")
+
+    if args.benchmark:
+        run_benchmark_once(args)
+        return 0
 
     if not args.watch:
         run_once(args)
