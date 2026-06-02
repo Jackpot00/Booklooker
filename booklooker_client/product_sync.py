@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -17,10 +18,12 @@ from .client import BooklookerClient, DEFAULT_BASE_URL
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ISBN_FILE = PROJECT_ROOT / "data" / "isbn.txt"
 DEFAULT_OUTPUT_FILE = PROJECT_ROOT / "data" / "booklooker_products.json"
+DEFAULT_RESULTS_CSV_FILE = PROJECT_ROOT / "resultats.csv"
 DEFAULT_INTERVAL_SECONDS = 3600
 DEFAULT_SEARCH_LIMIT = 150
 DEFAULT_EXTRA_FIELDS = "All"
 RESULT_SEPARATOR = "___"
+RESULTS_CSV_FIELDS = ["isbn", "status", "prix_booklooker", "duree_ms"]
 
 
 class SearchClient(Protocol):
@@ -30,6 +33,16 @@ class SearchClient(Protocol):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def ensure_results_csv(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return
+
+    with path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=RESULTS_CSV_FIELDS)
+        writer.writeheader()
 
 
 def load_identifiers(path: Path) -> list[str]:
@@ -193,6 +206,66 @@ def build_readable_results(identifier: str, data: Any) -> list[dict[str, Any]]:
     ]
 
 
+def product_status(product: dict[str, Any]) -> str:
+    if product.get("ok") and product.get("result_count", 0) > 0:
+        return "FOUND"
+    return "NOT_FOUND"
+
+
+def product_price(product: dict[str, Any]) -> str:
+    readable_results = product.get("readable_results")
+    if not isinstance(readable_results, list) or not readable_results:
+        return ""
+
+    first_result = readable_results[0]
+    if not isinstance(first_result, dict):
+        return ""
+    return str(first_result.get("price") or first_result.get("price_plus_shipping") or "")
+
+
+def append_results_csv_row(
+    path: Path, product: dict[str, Any], duration_ms: int
+) -> None:
+    with path.open("a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=RESULTS_CSV_FIELDS)
+        writer.writerow(
+            {
+                "isbn": product.get("identifier", ""),
+                "status": product_status(product),
+                "prix_booklooker": product_price(product),
+                "duree_ms": duration_ms,
+            }
+        )
+
+
+def build_performance_summary(
+    products: list[dict[str, Any]], elapsed_seconds: float
+) -> dict[str, Any]:
+    total = len(products)
+    found = sum(1 for product in products if product_status(product) == "FOUND")
+    not_found = total - found
+    success_rate = (found / total * 100) if total else 0.0
+    isbn_per_hour = (total / elapsed_seconds * 3600) if elapsed_seconds > 0 else 0.0
+
+    return {
+        "total": total,
+        "found": found,
+        "not_found": not_found,
+        "success_rate": success_rate,
+        "elapsed_seconds": elapsed_seconds,
+        "isbn_per_hour": isbn_per_hour,
+    }
+
+
+def print_performance_summary(summary: dict[str, Any]) -> None:
+    print(f"Total ISBN traites: {summary['total']}", file=sys.stderr)
+    print(f"Trouves: {summary['found']}", file=sys.stderr)
+    print(f"Introuvables: {summary['not_found']}", file=sys.stderr)
+    print(f"Taux de reussite: {summary['success_rate']:.2f}%", file=sys.stderr)
+    print(f"Temps total d'execution: {summary['elapsed_seconds']:.2f} s", file=sys.stderr)
+    print(f"ISBN traites par heure: {summary['isbn_per_hour']:.2f}", file=sys.stderr)
+
+
 def fetch_product_data(
     client: SearchClient,
     identifier: str,
@@ -278,9 +351,12 @@ def build_snapshot(
     limit: int = DEFAULT_SEARCH_LIMIT,
     extra_fields: str | None = DEFAULT_EXTRA_FIELDS,
     try_ean_fallback: bool = True,
+    results_csv_file: Path | None = None,
 ) -> dict[str, Any]:
-    products = [
-        fetch_product_data(
+    products = []
+    for identifier in identifiers:
+        started_at = time.perf_counter()
+        product = fetch_product_data(
             client,
             identifier,
             medium=medium,
@@ -288,8 +364,11 @@ def build_snapshot(
             extra_fields=extra_fields,
             try_ean_fallback=try_ean_fallback,
         )
-        for identifier in identifiers
-    ]
+        duration_ms = int(round((time.perf_counter() - started_at) * 1000))
+        products.append(product)
+        if results_csv_file is not None:
+            append_results_csv_row(results_csv_file, product, duration_ms)
+
     return {
         "generated_at": utc_now(),
         "source": {
@@ -317,6 +396,7 @@ def sync_products(
     client: SearchClient,
     isbn_file: Path = DEFAULT_ISBN_FILE,
     output_file: Path = DEFAULT_OUTPUT_FILE,
+    results_csv_file: Path | None = DEFAULT_RESULTS_CSV_FILE,
     *,
     medium: str = "book",
     limit: int = DEFAULT_SEARCH_LIMIT,
@@ -324,6 +404,8 @@ def sync_products(
     try_ean_fallback: bool = True,
 ) -> dict[str, Any]:
     identifiers = load_identifiers(isbn_file)
+    if results_csv_file is not None:
+        ensure_results_csv(results_csv_file)
     snapshot = build_snapshot(
         client,
         identifiers,
@@ -331,6 +413,7 @@ def sync_products(
         limit=limit,
         extra_fields=extra_fields,
         try_ean_fallback=try_ean_fallback,
+        results_csv_file=results_csv_file,
     )
     write_json_atomic(output_file, snapshot)
     return snapshot
@@ -351,6 +434,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_OUTPUT_FILE,
         help=f"JSON file to write. Default: {DEFAULT_OUTPUT_FILE}",
+    )
+    parser.add_argument(
+        "--results-csv",
+        type=Path,
+        default=DEFAULT_RESULTS_CSV_FILE,
+        help=f"CSV performance log to append. Default: {DEFAULT_RESULTS_CSV_FILE}",
     )
     parser.add_argument("--api-key", help="Booklooker API key. Defaults to BOOKLOOKER_API_KEY.")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -387,18 +476,24 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         rate_limit_per_minute=args.rate_limit_per_minute,
         max_retries=args.max_retries,
     )
+    started_at = time.perf_counter()
     snapshot = sync_products(
         client,
         args.isbn_file,
         args.output,
+        args.results_csv,
         medium=args.medium,
         limit=args.limit,
         extra_fields=args.extra_fields or None,
         try_ean_fallback=not args.no_ean_fallback,
     )
+    elapsed_seconds = time.perf_counter() - started_at
     print(
         f"Wrote {len(snapshot['products'])} products to {args.output}",
         file=sys.stderr,
+    )
+    print_performance_summary(
+        build_performance_summary(snapshot["products"], elapsed_seconds)
     )
     return snapshot
 
