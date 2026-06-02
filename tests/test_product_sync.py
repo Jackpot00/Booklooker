@@ -116,9 +116,8 @@ class ProductSyncTests(unittest.TestCase):
                 try_ean_fallback=False,
             )
             written = json.loads(output_file.read_text(encoding="utf-8"))
-            csv_rows = list(
-                csv.DictReader(results_csv_file.open(newline="", encoding="utf-8"))
-            )
+            with results_csv_file.open(newline="", encoding="utf-8") as csv_file:
+                csv_rows = list(csv.DictReader(csv_file))
 
         self.assertEqual(snapshot["source"]["identifier_count"], 2)
         self.assertEqual(written["products"][0]["identifier"], "9783608942286")
