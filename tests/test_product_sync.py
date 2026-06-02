@@ -1,3 +1,4 @@
+import csv
 import json
 import tempfile
 import unittest
@@ -98,10 +99,11 @@ class ProductSyncTests(unittest.TestCase):
             tmp_path = Path(tmp)
             isbn_file = tmp_path / "isbn.txt"
             output_file = tmp_path / "products.json"
+            results_csv_file = tmp_path / "resultats.csv"
             isbn_file.write_text("9783608942286\n9783525516805\n", encoding="utf-8")
             client = FakeSearchClient(
                 [
-                    response([{"title": "First"}]),
+                    response([{"title": "First", "price": "12.30"}]),
                     response([{"title": "Second"}]),
                 ]
             )
@@ -110,15 +112,23 @@ class ProductSyncTests(unittest.TestCase):
                 client,
                 isbn_file,
                 output_file,
+                results_csv_file,
                 try_ean_fallback=False,
             )
             written = json.loads(output_file.read_text(encoding="utf-8"))
+            with results_csv_file.open(newline="", encoding="utf-8") as csv_file:
+                csv_rows = list(csv.DictReader(csv_file))
 
         self.assertEqual(snapshot["source"]["identifier_count"], 2)
         self.assertEqual(written["products"][0]["identifier"], "9783608942286")
         self.assertEqual(written["products"][1]["data"], [{"title": "Second"}])
         self.assertEqual(client.calls[0]["extraFields"], "All")
         self.assertEqual(client.calls[0]["limit"], 150)
+        self.assertEqual(len(csv_rows), 2)
+        self.assertEqual(csv_rows[0]["isbn"], "9783608942286")
+        self.assertEqual(csv_rows[0]["status"], "FOUND")
+        self.assertEqual(csv_rows[0]["prix_booklooker"], "12.30")
+        self.assertTrue(csv_rows[0]["duree_ms"].isdigit())
 
 
 if __name__ == "__main__":
