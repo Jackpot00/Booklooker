@@ -381,34 +381,57 @@ def benchmark_products(
 
     csv_file.parent.mkdir(parents=True, exist_ok=True)
     started_at = now()
-    rows: list[dict[str, str]] = []
     found_count = 0
     measured_search_requests = 0
     request_count_before = request_count() if request_count is not None else None
 
-    for identifier in identifiers:
-        item_started_at = now()
-        product = fetch_product_data(
-            client,
-            identifier,
-            medium=medium,
-            limit=limit,
-            extra_fields=extra_fields,
-            try_ean_fallback=try_ean_fallback,
+    with csv_file.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["ean", "status", "prix", "temps_ms"],
         )
-        elapsed_ms = max(0, round((now() - item_started_at) * 1000))
-        measured_search_requests += len(product.get("attempts", []))
-        found = product.get("result_count", 0) > 0
-        if found:
-            found_count += 1
-        rows.append(
-            {
-                "ean": identifier,
-                "status": "found" if found else "not_found",
-                "prix": first_benchmark_price(product),
-                "temps_ms": str(elapsed_ms),
-            }
-        )
+        writer.writeheader()
+        handle.flush()
+
+        for index, identifier in enumerate(identifiers, start=1):
+            item_started_at = now()
+            try:
+                product = fetch_product_data(
+                    client,
+                    identifier,
+                    medium=medium,
+                    limit=limit,
+                    extra_fields=extra_fields,
+                    try_ean_fallback=try_ean_fallback,
+                )
+            except Exception as exc:
+                print(
+                    "Benchmark failed after "
+                    f"{index - 1} EAN processed; current EAN {identifier}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
+
+            elapsed_ms = max(0, round((now() - item_started_at) * 1000))
+            measured_search_requests += len(product.get("attempts", []))
+            found = product.get("result_count", 0) > 0
+            if found:
+                found_count += 1
+            writer.writerow(
+                {
+                    "ean": identifier,
+                    "status": "found" if found else "not_found",
+                    "prix": first_benchmark_price(product),
+                    "temps_ms": str(elapsed_ms),
+                }
+            )
+            handle.flush()
+            if index % 100 == 0 or index == len(identifiers):
+                print(
+                    f"Progress: {index}/{len(identifiers)} EAN processed",
+                    flush=True,
+                )
 
     elapsed_seconds = max(0.0, now() - started_at)
     analyzed_count = len(identifiers)
@@ -424,14 +447,6 @@ def benchmark_products(
         api_requests = request_count() - request_count_before
     else:
         api_requests = measured_search_requests
-
-    with csv_file.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["ean", "status", "prix", "temps_ms"],
-        )
-        writer.writeheader()
-        writer.writerows(rows)
 
     return {
         "analyzed_count": analyzed_count,
