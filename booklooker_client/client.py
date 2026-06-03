@@ -28,6 +28,7 @@ DEFAULT_RATE_LIMIT = 100
 DEFAULT_RATE_PERIOD = 60.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_FACTOR = 0.5
+DEFAULT_MAX_RETRY_AFTER = 60.0
 TOKEN_ERROR_CODES = {"TOKEN_EXPIRED", "TOKEN_MISSING", "TOKEN_UNKNOWN"}
 RETRY_API_CODES = {"QUOTA_EXCEEDED", "SERVER_DOWN", "TEMPORARILY_BLOCKED"}
 RETRY_HTTP_STATUSES = {429, 500, 502, 503, 504}
@@ -486,6 +487,8 @@ class BooklookerClient:
         self, attempt: int, response: Response | None = None
     ) -> None:
         retry_after = self._retry_after(response)
+        if response is not None:
+            response.close()
         if retry_after is not None:
             time.sleep(retry_after)
             return
@@ -498,7 +501,7 @@ class BooklookerClient:
         if value is None:
             return None
         try:
-            return max(0.0, float(value))
+            return min(DEFAULT_MAX_RETRY_AFTER, max(0.0, float(value)))
         except ValueError:
             return None
 
